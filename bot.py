@@ -1,37 +1,33 @@
 """
-Bot Telegram — Tracking VA Instagram + GetMySocial + Supabase (Lot 2)
+Bot Telegram — Tracking VA Instagram + GetMySocial + Supabase (v2.1)
 ---------------------------------------------------------------------
+Refonte sans créneaux horaires précis.
+Objectif simple : 4 posts par compte par jour.
+
 Rapports automatiques :
     - 00h00 FR : Clics jour J-1 complet
-    - 09h30 FR : Insta MATIN (vérif post 07h30)
     - 12h00 FR : Clics depuis 00h00
-    - 20h00 FR : Insta SOIR (vérif post 16h30)
+    - 20h00 FR : Bilan Insta du jour (X/4 posts par compte + total vues + best)
     - Dimanche 20h05 : Récap hebdo
     - 1er du mois 09h35 : Récap mensuel
 
 Alertes intelligentes :
     - Shadowban : Reel < 30% moy 7 précédents, 2 Reels consécutifs
     - Chute clics : Jour J < 50% du jour J-1
-    - VA sous-perf : 3+ ratés (❌ + ⚠️) sur 7 jours (dans récap dimanche)
+    - VA sous-perf : un compte du VA <4 posts pendant 3+ jours sur 7 (récap dimanche)
 
 Commandes interactives (à taper dans le canal) :
-    /today          — snapshot live de tous les comptes
-    /stats USER     — stats d'un compte spécifique
-    /week           — récap des 7 derniers jours
-    /top            — top 3 Reels du jour
-    /leaderboard    — classement VA live
-    /pause USER     — met un compte en pause
-    /resume USER    — réactive un compte en pause
-    /help           — affiche les commandes
+    /today, /stats <user>, /week, /top, /leaderboard,
+    /pause <user>, /resume <user>, /help
 
 Variables d'environnement requises (Railway) :
     TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, RAPIDAPI_KEY, GMS_API_KEY,
-    SUPABASE_URL, SUPABASE_KEY,
-    GITHUB_TOKEN (PAT classic avec scope 'repo'),
-    GITHUB_REPO  (format owner/repo, ex: lucasdessoly2-lgtm/bot-tracking-va)
+    SUPABASE_URL, SUPABASE_KEY, GITHUB_TOKEN, GITHUB_REPO
 
-Variables optionnelles :
-    RAPIDAPI_HOST, GMS_HOST, GITHUB_BRANCH (par défaut 'main')
+Format accounts.py :
+    Tuples à 2 éléments  : ("username_insta", "NOM_VA")
+    Tuples à 3 éléments  : ("username_insta", "NOM_VA", "shortcode_gms")
+    Le 3ème champ est optionnel.
 """
 
 import base64
@@ -61,7 +57,7 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN")
-GITHUB_REPO = os.environ.get("GITHUB_REPO")  # format: owner/repo
+GITHUB_REPO = os.environ.get("GITHUB_REPO")
 GITHUB_BRANCH = os.environ.get("GITHUB_BRANCH", "main")
 ACCOUNTS_FILE_PATH = "accounts.py"
 
@@ -71,21 +67,20 @@ GMS_BASE_URL = f"https://{GMS_HOST}"
 
 PARIS_TZ = pytz.timezone("Europe/Paris")
 
-MATIN_TARGET = time(7, 30)
-SOIR_TARGET = time(16, 30)
-WINDOW_MINUTES = 30
+# Objectif posts/jour par compte
+DAILY_POSTS_TARGET = 4
 
-# --- Seuils d'alertes ---
+# Seuils d'alertes
 SHADOWBAN_DROP_RATIO = 0.30
 SHADOWBAN_CONSECUTIVE = 2
 SHADOWBAN_REFERENCE_REELS = 7
 CLICKS_DROP_RATIO = 0.50
 CLICKS_DROP_MIN_BASELINE = 10
-VA_UNDERPERF_THRESHOLD = 3
-VA_UNDERPERF_DAYS = 7
+VA_UNDERPERF_DAYS_MISSING = 3   # nb jours où un compte rate l'objectif
+VA_UNDERPERF_LOOKBACK = 7       # sur les 7 derniers jours
 ALERT_DEDUP_HOURS = 24
 
-# --- Cache GMS ---
+# Cache GMS
 _GMS_LINKS_CACHE: dict = {}
 _GMS_CACHE_LAST_REFRESH: Optional[datetime] = None
 _GMS_CACHE_TTL_HOURS = 6
@@ -98,7 +93,46 @@ log = logging.getLogger("bot")
 
 
 # ============================================================================
-#  TELEGRAM (send + polling)
+#  HELPERS — ACCOUNTS (gère tuples à 2 ou 3 éléments)
+# ============================================================================
+
+def account_username(account) -> str:
+    return account[0]
+
+
+def account_va(account) -> str:
+    return account[1]
+
+
+def account_gms_override(account) -> Optional[str]:
+    """Renvoie le shortcode GMS forcé (3ème champ) ou None."""
+    if len(account) >= 3:
+        sc = account[2]
+        if sc and not sc.startswith("TODO"):
+            return sc.lower()
+    return None
+
+
+def iter_accounts():
+    """Itère sur les comptes en yieldant (username, va, gms_override)."""
+    for a in ACCOUNTS:
+        yield account_username(a), account_va(a), account_gms_override(a)
+
+
+def group_by_va() -> dict:
+    """Renvoie { va_name: [(username, gms_override), ...] }."""
+    groups: dict = {}
+    for u, va, gms in iter_accounts():
+        groups.setdefault(va, []).append((u, gms))
+    return groups
+
+
+def all_usernames() -> list:
+    return [u for u, _, _ in iter_accounts()]
+
+
+# ============================================================================
+#  TELEGRAM
 # ============================================================================
 
 def send_telegram(text: str) -> None:
@@ -121,7 +155,6 @@ def send_telegram(text: str) -> None:
 
 
 def poll_telegram_updates(offset: int) -> list:
-    """Long polling Telegram pour récupérer les messages entrants."""
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     params = {
         "offset": offset,
@@ -134,7 +167,7 @@ def poll_telegram_updates(offset: int) -> list:
             return r.json().get("result", [])
         log.warning("getUpdates %s: %s", r.status_code, r.text[:200])
     except requests.exceptions.Timeout:
-        pass  # normal pour long polling
+        pass
     except Exception as e:
         log.error("Polling error: %s", e)
     return []
@@ -211,7 +244,6 @@ def supabase_insert(table: str, payload: dict) -> bool:
 # ============================================================================
 
 def github_get_file(file_path: str) -> tuple:
-    """Renvoie (content_str, sha) du fichier ou (None, None) si erreur."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
         return None, None
     url = f"https://api.github.com/repos/{GITHUB_REPO}/contents/{file_path}"
@@ -222,18 +254,16 @@ def github_get_file(file_path: str) -> tuple:
     try:
         r = requests.get(url, headers=headers, params={"ref": GITHUB_BRANCH}, timeout=30)
         if not r.ok:
-            log.warning("GitHub GET %s -> %s %s", file_path, r.status_code, r.text[:200])
+            log.warning("GH GET %s -> %s", file_path, r.status_code)
             return None, None
         data = r.json()
-        content_b64 = data.get("content", "")
-        sha = data.get("sha")
         try:
-            content = base64.b64decode(content_b64).decode("utf-8")
+            content = base64.b64decode(data.get("content", "")).decode("utf-8")
         except Exception:
             return None, None
-        return content, sha
+        return content, data.get("sha")
     except Exception as e:
-        log.error("GitHub GET exception: %s", e)
+        log.error("GH GET exception: %s", e)
         return None, None
 
 
@@ -255,29 +285,22 @@ def github_put_file(file_path: str, new_content: str, sha: str, message: str) ->
         r = requests.put(url, headers=headers, json=payload, timeout=30)
         if r.ok:
             return True
-        log.warning("GitHub PUT %s -> %s %s", file_path, r.status_code, r.text[:200])
+        log.warning("GH PUT %s -> %s %s", file_path, r.status_code, r.text[:200])
     except Exception as e:
-        log.error("GitHub PUT exception: %s", e)
+        log.error("GH PUT exception: %s", e)
     return False
 
 
 def toggle_account_pause(username: str, pause: bool) -> tuple:
-    """Met en pause (pause=True) ou réactive (pause=False) un username dans accounts.py.
-    Renvoie (success: bool, response_message: str)."""
     if not GITHUB_TOKEN or not GITHUB_REPO:
-        return False, "⚠️ GitHub non configuré (GITHUB_TOKEN / GITHUB_REPO manquant)."
-
+        return False, "⚠️ GitHub non configuré."
     content, sha = github_get_file(ACCOUNTS_FILE_PATH)
     if not content:
         return False, "⚠️ Impossible de lire accounts.py depuis GitHub."
-
     lines = content.splitlines(keepends=True)
     new_lines = []
     found_line_idx = None
-
     for idx, line in enumerate(lines):
-        # Regarde si la ligne contient `("username", ...)` avec ou sans # devant
-        # Match insensible à la casse
         if re.search(rf'\(\s*"{re.escape(username)}"\s*,', line, re.IGNORECASE):
             stripped = line.lstrip()
             is_commented = stripped.startswith("#")
@@ -285,7 +308,6 @@ def toggle_account_pause(username: str, pause: bool) -> tuple:
                 if is_commented:
                     new_lines.append(line)
                     return False, f"ℹ️ <code>{username}</code> est déjà en pause."
-                # Ajouter # devant (en préservant l'indentation)
                 indent = line[:len(line) - len(stripped)]
                 line = f"{indent}# {stripped}"
                 found_line_idx = idx
@@ -293,30 +315,24 @@ def toggle_account_pause(username: str, pause: bool) -> tuple:
                 if not is_commented:
                     new_lines.append(line)
                     return False, f"ℹ️ <code>{username}</code> n'est pas en pause."
-                # Retirer le # devant
                 indent = line[:len(line) - len(stripped)]
-                rest = stripped[1:].lstrip()  # retire # et espaces
+                rest = stripped[1:].lstrip()
                 line = f"{indent}{rest}"
                 found_line_idx = idx
         new_lines.append(line)
-
     if found_line_idx is None:
-        valid = [u for u, _ in ACCOUNTS if u.lower() == username.lower()]
-        if valid:
-            return False, f"⚠️ <code>{username}</code> n'est pas dans accounts.py (peut-être déjà retiré ?)."
         return False, f"❌ Compte <code>{username}</code> introuvable dans accounts.py."
-
     new_content = "".join(new_lines)
     action = "Pause" if pause else "Resume"
-    commit_msg = f"{action} {username} via Telegram command"
-    success = github_put_file(ACCOUNTS_FILE_PATH, new_content, sha, commit_msg)
+    success = github_put_file(ACCOUNTS_FILE_PATH, new_content, sha,
+                              f"{action} {username} via Telegram")
     if success:
         verb = "mis en pause" if pause else "réactivé"
         return True, (
             f"✅ <code>{username}</code> {verb}.\n"
-            f"Railway va redéployer automatiquement dans ~30 sec."
+            f"Railway va redéployer dans ~30 sec."
         )
-    return False, "⚠️ Erreur lors du commit GitHub. Vérifie le GITHUB_TOKEN."
+    return False, "⚠️ Erreur lors du commit GitHub."
 
 
 # ============================================================================
@@ -337,7 +353,7 @@ def fetch_recent_reels(username: str) -> list:
             timeout=30,
         )
         if not r.ok:
-            log.warning("RapidAPI %s -> %s %s", username, r.status_code, r.text[:200])
+            log.warning("RapidAPI %s -> %s", username, r.status_code)
             return []
         data = r.json()
         items = (
@@ -375,12 +391,18 @@ def get_reel_shortcode(reel: dict) -> str:
     return str(reel.get("code") or reel.get("shortcode") or reel.get("pk") or "")
 
 
-def reel_link(reel: dict) -> str:
-    """Renvoie un lien HTML vers le Reel, ou chaîne vide si pas de shortcode."""
+def reel_url(reel: dict) -> Optional[str]:
     sc = get_reel_shortcode(reel)
     if not sc:
+        return None
+    return f"https://www.instagram.com/reel/{sc}/"
+
+
+def reel_link_html(reel: dict, label: str = "voir") -> str:
+    u = reel_url(reel)
+    if not u:
         return ""
-    return f' · <a href="https://www.instagram.com/reel/{sc}/">voir</a>'
+    return f'<a href="{u}">{label}</a>'
 
 
 def format_number(n) -> str:
@@ -406,22 +428,26 @@ def reel_post_dt(reel: dict) -> Optional[datetime]:
         return None
 
 
-def find_post_in_window(items: list, target_time_paris: time):
+def collect_today_posts(reels: list) -> list:
+    """Filtre les Reels publiés aujourd'hui (heure de Paris).
+    Renvoie une liste triée chronologiquement de tuples (post_dt, reel)."""
     today_paris = datetime.now(PARIS_TZ).date()
-    target_dt = PARIS_TZ.localize(datetime.combine(today_paris, target_time_paris))
-    out_of_window = None
-    for item in items:
-        post_dt = reel_post_dt(item)
-        if not post_dt or post_dt.date() != today_paris:
-            continue
-        delta_min = abs((post_dt - target_dt).total_seconds()) / 60
-        if delta_min <= WINDOW_MINUTES:
-            return "in_window", post_dt, item
-        if out_of_window is None:
-            out_of_window = (post_dt, item)
-    if out_of_window:
-        return "out_of_window", out_of_window[0], out_of_window[1]
-    return "no_post", None, None
+    posts = []
+    for r in reels:
+        dt = reel_post_dt(r)
+        if dt and dt.date() == today_paris:
+            posts.append((dt, r))
+    posts.sort(key=lambda x: x[0])
+    return posts
+
+
+def status_emoji(count: int) -> str:
+    """Emoji selon le nombre de posts du jour vs DAILY_POSTS_TARGET."""
+    if count >= DAILY_POSTS_TARGET:
+        return "🟢"
+    if count == 0:
+        return "🔴"
+    return "🟡"
 
 
 # ============================================================================
@@ -443,7 +469,7 @@ def gms_request(path: str, params: Optional[dict] = None) -> Optional[dict]:
     try:
         r = requests.get(url, headers=headers, params=params or {}, timeout=30)
         if not r.ok:
-            log.warning("GMS %s -> %s %s", path, r.status_code, r.text[:200])
+            log.warning("GMS %s -> %s", path, r.status_code)
             return None
         return r.json()
     except Exception as e:
@@ -485,16 +511,22 @@ def load_gms_links_map() -> dict:
             break
     _GMS_LINKS_CACHE = mapping
     _GMS_CACHE_LAST_REFRESH = now
-    log.info("GMS links map refreshed: %d entries", len(mapping))
+    log.info("GMS links map: %d entries", len(mapping))
     return mapping
 
 
-def find_gms_link_id(username: str, links_map: dict) -> Optional[str]:
+def find_gms_link_id(username: str, gms_override: Optional[str], links_map: dict) -> Optional[str]:
+    """Trouve le link_id GMS pour un username Insta.
+    Si gms_override fourni, l'utilise en priorité.
+    """
+    if gms_override and gms_override in links_map:
+        return links_map[gms_override]
     candidates = [
         username_to_gms_shortcode(username),
         username.lower(),
         username.lower().replace(".", "-"),
         username.lower().replace(".", "_"),
+        username.lower().replace(".", ""),
     ]
     for c in candidates:
         if c in links_map:
@@ -517,14 +549,14 @@ def gms_date_range(period: str) -> tuple:
 
 def fetch_gms_clicks_and_countries(link_id: str, period: str) -> tuple:
     start_iso, end_iso = gms_date_range(period)
-    common_params_variants = [
+    variants = [
         {"link_id": link_id, "start_date": start_iso, "end_date": end_iso},
         {"link_id": link_id, "from": start_iso, "to": end_iso},
         {"link_id": link_id, "start": start_iso, "end": end_iso},
     ]
     total_clicks: Optional[int] = None
     countries: list = []
-    for params in common_params_variants:
+    for params in variants:
         overview = gms_request("/v3/analytics/overview", params=params)
         if overview:
             total_clicks = (
@@ -535,27 +567,15 @@ def fetch_gms_clicks_and_countries(link_id: str, period: str) -> tuple:
             )
             if total_clicks is not None:
                 break
-    for params in common_params_variants:
+    for params in variants:
         breakdown = gms_request("/v3/analytics/breakdowns/country", params=params)
         if breakdown:
             rows = breakdown.get("data") or breakdown.get("rows") or []
             if rows:
                 parsed = []
                 for r in rows:
-                    code = (
-                        r.get("country_code")
-                        or r.get("code")
-                        or r.get("country")
-                        or r.get("key")
-                        or "??"
-                    )
-                    val = (
-                        r.get("clicks")
-                        or r.get("visits")
-                        or r.get("count")
-                        or r.get("value")
-                        or 0
-                    )
+                    code = r.get("country_code") or r.get("code") or r.get("country") or r.get("key") or "??"
+                    val = r.get("clicks") or r.get("visits") or r.get("count") or r.get("value") or 0
                     parsed.append((code, val))
                 parsed.sort(key=lambda x: x[1], reverse=True)
                 total = sum(v for _, v in parsed) or 1
@@ -591,23 +611,43 @@ def save_reel(username: str, reel: dict) -> None:
     )
 
 
-def save_post_status(username: str, va_name: str, slot: str, status: str,
-                     post_dt: Optional[datetime], item: Optional[dict]) -> None:
+def save_daily_posts(username: str, va_name: str, posts: list) -> tuple:
+    """posts = liste de tuples (post_dt, reel). Renvoie (count, total_views, best_views, best_url)."""
+    count = len(posts)
+    total_views = 0
+    best_views = 0
+    best_url = None
+    posts_json = []
+    for post_dt, reel in posts:
+        _, views, likes, comments = parse_reel_stats(reel)
+        v = int(views) if views else 0
+        total_views += v
+        if v > best_views:
+            best_views = v
+            best_url = reel_url(reel)
+        posts_json.append({
+            "time": post_dt.strftime("%H:%M"),
+            "shortcode": get_reel_shortcode(reel),
+            "views": v,
+            "likes": int(likes) if likes else 0,
+            "comments": int(comments) if comments else 0,
+        })
     today_paris = datetime.now(PARIS_TZ).date()
-    payload = {
-        "username": username,
-        "va_name": va_name,
-        "date": today_paris.isoformat(),
-        "slot": slot,
-        "status": status,
-    }
-    if post_dt:
-        payload["post_time"] = post_dt.strftime("%H:%M:%S")
-    if item:
-        _, views, _, _ = parse_reel_stats(item)
-        payload["reel_shortcode"] = get_reel_shortcode(item)
-        payload["views"] = int(views) if views else 0
-    supabase_upsert("post_status", payload, on_conflict="username,date,slot")
+    supabase_upsert(
+        "daily_posts",
+        {
+            "username": username,
+            "va_name": va_name,
+            "date": today_paris.isoformat(),
+            "post_count": count,
+            "total_views": total_views,
+            "best_views": best_views,
+            "best_url": best_url or "",
+            "posts": posts_json,
+        },
+        on_conflict="username,date",
+    )
+    return count, total_views, best_views, best_url
 
 
 def save_clicks(username: str, period: str, clicks: Optional[int], top_countries: list) -> None:
@@ -649,7 +689,6 @@ def has_recent_alert(alert_type: str, target: str, hours: int = ALERT_DEDUP_HOUR
 def log_and_send_alert(alert_type: str, target: str, message: str,
                        details: Optional[dict] = None) -> None:
     if has_recent_alert(alert_type, target):
-        log.info("Alert %s/%s skipped (recent dup)", alert_type, target)
         return
     send_telegram(message)
     supabase_insert("alerts_log", {
@@ -714,150 +753,140 @@ def detect_clicks_drop(username: str, today_clicks: int) -> None:
     msg = (
         f"📉 <b>ALERTE CHUTE CLICS</b>\n"
         f"<code>{username}</code>\n"
-        f"Aujourd'hui : <b>{today_clicks}</b> clics\n"
-        f"Hier : <b>{yest_clicks}</b> clics\n"
-        f"Évolution : <b>{pct}%</b>"
+        f"Aujourd'hui : <b>{today_clicks}</b> · Hier : <b>{yest_clicks}</b> "
+        f"({pct}%)"
     )
-    log_and_send_alert("clicks_drop", username, msg, {
-        "today": today_clicks,
-        "yesterday": yest_clicks,
-    })
+    log_and_send_alert("clicks_drop", username, msg)
 
 
 def detect_va_underperf_for_recap() -> list:
+    """Renvoie liste (va_name, [(username, jours_ratés), ...]) pour les VA avec ≥1 compte raté ≥3 jours."""
     today = datetime.now(PARIS_TZ).date()
-    since = (today - timedelta(days=VA_UNDERPERF_DAYS - 1)).isoformat()
+    since = (today - timedelta(days=VA_UNDERPERF_LOOKBACK - 1)).isoformat()
     rows = supabase_select(
-        "post_status",
-        {
-            "date": f"gte.{since}",
-            "order": "date.desc",
-        },
+        "daily_posts",
+        {"date": f"gte.{since}", "limit": 10000},
     )
     if not rows:
         return []
-    misses_by_va: dict = {}
-    total_by_va: dict = {}
+    misses_by_user: dict = {}
+    user_to_va: dict = {}
     for r in rows:
+        u = r.get("username")
         va = r.get("va_name", "?")
-        total_by_va[va] = total_by_va.get(va, 0) + 1
-        if r.get("status") in ("no_post", "out_of_window"):
-            misses_by_va[va] = misses_by_va.get(va, 0) + 1
-    result = []
-    for va, miss_count in misses_by_va.items():
-        if miss_count >= VA_UNDERPERF_THRESHOLD:
-            result.append((va, miss_count, total_by_va.get(va, 0)))
-    result.sort(key=lambda x: x[1], reverse=True)
+        user_to_va[u] = va
+        cnt = r.get("post_count", 0) or 0
+        if cnt < DAILY_POSTS_TARGET:
+            misses_by_user[u] = misses_by_user.get(u, 0) + 1
+    flagged_by_va: dict = {}
+    for u, miss_count in misses_by_user.items():
+        if miss_count >= VA_UNDERPERF_DAYS_MISSING:
+            va = user_to_va.get(u, "?")
+            flagged_by_va.setdefault(va, []).append((u, miss_count))
+    result = sorted(flagged_by_va.items(), key=lambda x: -sum(m for _, m in x[1]))
     return result
 
 
 # ============================================================================
-#  RAPPORTS INSTAGRAM (matin/soir)
+#  RAPPORT BILAN INSTA (20h00)
 # ============================================================================
 
-def generate_insta_report(target_time_paris: time, label: str, slot_name: str) -> str:
+def generate_insta_recap() -> str:
+    """Rapport unique en fin de journée : X/4 posts par compte + vues + best."""
     now_paris = datetime.now(PARIS_TZ)
-
-    va_groups: dict = {}
-    for username, va_name in ACCOUNTS:
-        va_groups.setdefault(va_name, []).append(username)
-
-    lines = []
     date_str = now_paris.strftime("%A %d %B %Y %H:%M")
-    lines.append(f"📊 <b>RAPPORT {label}</b> — {date_str}")
-    lines.append("")
 
-    total_ok = total_out = total_missing = total_accounts = 0
+    va_groups = group_by_va()
 
-    for va_name, usernames in va_groups.items():
-        va_ok = va_out = va_missing = 0
+    lines = [f"📊 <b>BILAN INSTA</b> — {date_str}", ""]
+
+    grand_total_posts = 0
+    grand_target_posts = 0
+    grand_total_views = 0
+
+    for va_name, accounts in va_groups.items():
         va_lines = []
-        for username in usernames:
-            total_accounts += 1
+        va_posts = 0
+        va_target = len(accounts) * DAILY_POSTS_TARGET
+        va_views = 0
+        for username, _ in accounts:
             reels = fetch_recent_reels(username)
             for r in reels[:10]:
                 save_reel(username, r)
-            status, post_dt, item = find_post_in_window(reels, target_time_paris)
-            save_post_status(username, va_name, slot_name, status, post_dt, item)
+            today_posts = collect_today_posts(reels)
+            count, total_views, best_views, best_url = save_daily_posts(
+                username, va_name, today_posts
+            )
             detect_shadowban(username)
 
-            if status == "in_window":
-                va_ok += 1
-                total_ok += 1
-                _, views, likes, comments = parse_reel_stats(item)
-                hhmm = post_dt.strftime("%Hh%M")
-                va_lines.append(
-                    f"  ✅ <code>{username}</code> — Posté {hhmm}{reel_link(item)}\n"
-                    f"     👁 {format_number(views)} vues · "
-                    f"❤️ {format_number(likes)} · "
-                    f"💬 {format_number(comments)}"
-                )
-            elif status == "out_of_window":
-                va_out += 1
-                total_out += 1
-                _, views, likes, comments = parse_reel_stats(item)
-                hhmm = post_dt.strftime("%Hh%M")
-                va_lines.append(
-                    f"  ⚠️ <code>{username}</code> — Hors créneau ({hhmm}){reel_link(item)}\n"
-                    f"     👁 {format_number(views)} vues · "
-                    f"❤️ {format_number(likes)} · "
-                    f"💬 {format_number(comments)}"
-                )
-            else:
-                va_missing += 1
-                total_missing += 1
-                va_lines.append(
-                    f"  ❌ <code>{username}</code> — Pas de post {label.lower()}"
-                )
+            va_posts += count
+            va_views += total_views
+            emoji = status_emoji(count)
+
+            base = (
+                f"  {emoji} <code>{username}</code> — "
+                f"<b>{count}/{DAILY_POSTS_TARGET}</b> posts · "
+                f"👁 {format_number(total_views)} vues"
+            )
+            if best_views > 0:
+                if best_url:
+                    base += f' · <a href="{best_url}">best {format_number(best_views)}</a>'
+                else:
+                    base += f' · best {format_number(best_views)}'
+            va_lines.append(base)
+
+        grand_total_posts += va_posts
+        grand_target_posts += va_target
+        grand_total_views += va_views
 
         lines.append(
-            f"👤 <b>{va_name}</b> ({len(usernames)} comptes) "
-            f"→ {va_ok}✅ / {va_out}⚠️ / {va_missing}❌"
+            f"👤 <b>{va_name}</b> — {va_posts}/{va_target} posts · "
+            f"👁 {format_number(va_views)} vues"
         )
         lines.extend(va_lines)
         lines.append("")
 
     lines.append(
-        f"📈 <b>TOTAL : {total_ok}✅ / {total_out}⚠️ / {total_missing}❌</b> "
-        f"sur {total_accounts} comptes"
+        f"📈 <b>TOTAL : {grand_total_posts}/{grand_target_posts} posts</b> · "
+        f"👁 <b>{format_number(grand_total_views)} vues</b>"
     )
-
     return "\n".join(lines)
 
 
 # ============================================================================
-#  RAPPORTS CLICS (00h/12h)
+#  RAPPORT CLICS (00h et 12h)
 # ============================================================================
 
 def generate_clicks_report(period: str, label: str, header_emoji: str) -> str:
     now_paris = datetime.now(PARIS_TZ)
+    va_groups = group_by_va()
 
-    va_groups: dict = {}
-    for username, va_name in ACCOUNTS:
-        va_groups.setdefault(va_name, []).append(username)
-
-    lines = []
-    date_str = now_paris.strftime("%A %d %B %Y %H:%M")
-    lines.append(f"{header_emoji} <b>RAPPORT {label}</b> — {date_str}")
-    lines.append("")
+    lines = [
+        f"{header_emoji} <b>RAPPORT {label}</b> — "
+        f"{now_paris.strftime('%A %d %B %Y %H:%M')}",
+        "",
+    ]
 
     if not GMS_API_KEY:
-        lines.append("⚠️ <i>GMS_API_KEY non configurée — clics indisponibles</i>")
+        lines.append("⚠️ <i>GMS_API_KEY non configurée</i>")
         return "\n".join(lines)
 
     links_map = load_gms_links_map()
     if not links_map:
-        lines.append("⚠️ <i>Impossible de récupérer la liste des liens GMS</i>")
+        lines.append("⚠️ <i>Impossible de récupérer les liens GMS</i>")
         return "\n".join(lines)
 
     total_clicks_global = 0
 
-    for va_name, usernames in va_groups.items():
+    for va_name, accounts in va_groups.items():
         va_lines = []
-        for username in usernames:
-            link_id = find_gms_link_id(username, links_map)
+        for username, gms_override in accounts:
+            link_id = find_gms_link_id(username, gms_override, links_map)
             if not link_id:
-                va_lines.append(f"  ❓ <code>{username}</code> — Lien GMS introuvable")
+                hint = f" (cherché : {gms_override})" if gms_override else ""
+                va_lines.append(
+                    f"  ❓ <code>{username}</code> — Lien GMS introuvable{hint}"
+                )
                 continue
             clicks, countries = fetch_gms_clicks_and_countries(link_id, period)
             if clicks is None:
@@ -871,11 +900,10 @@ def generate_clicks_report(period: str, label: str, header_emoji: str) -> str:
                 " ".join(f"{c} ({p}%)" for c, p in countries) if countries else "—"
             )
             va_lines.append(
-                f"  🔗 <code>{username}</code> — {format_number(clicks)} clics\n"
-                f"     🌍 {countries_str}"
+                f"  🔗 <code>{username}</code> — {format_number(clicks)} clics · 🌍 {countries_str}"
             )
 
-        lines.append(f"👤 <b>{va_name}</b> ({len(usernames)} comptes)")
+        lines.append(f"👤 <b>{va_name}</b>")
         lines.extend(va_lines)
         lines.append("")
 
@@ -884,7 +912,7 @@ def generate_clicks_report(period: str, label: str, header_emoji: str) -> str:
 
 
 # ============================================================================
-#  AGRÉGATIONS (récap hebdo / mensuel + leaderboard)
+#  AGRÉGATIONS (récap hebdo / mensuel)
 # ============================================================================
 
 def fetch_aggregated_clicks(start_date: date, end_date: date) -> dict:
@@ -894,36 +922,36 @@ def fetch_aggregated_clicks(start_date: date, end_date: date) -> dict:
     )
     result: dict = {}
     for r in rows:
-        d = r.get("date", "")
         try:
-            d_obj = datetime.fromisoformat(d).date()
+            d_obj = datetime.fromisoformat(r.get("date", "")).date()
         except Exception:
             continue
         if d_obj > end_date:
             continue
         u = r.get("username")
-        c = r.get("clicks", 0) or 0
-        result[u] = result.get(u, 0) + c
+        result[u] = result.get(u, 0) + (r.get("clicks", 0) or 0)
     return result
 
 
-def fetch_aggregated_views(start_date: date, end_date: date) -> dict:
+def fetch_aggregated_daily_posts(start_date: date, end_date: date) -> dict:
+    """Renvoie { username: {"posts": int, "views": int} }."""
     rows = supabase_select(
-        "reels_history",
-        {"taken_at": f"gte.{start_date.isoformat()}", "limit": 10000},
+        "daily_posts",
+        {"date": f"gte.{start_date.isoformat()}", "limit": 10000},
     )
     result: dict = {}
     for r in rows:
-        ta = r.get("taken_at", "")
         try:
-            ta_dt = datetime.fromisoformat(ta.replace("Z", "+00:00"))
+            d_obj = datetime.fromisoformat(r.get("date", "")).date()
         except Exception:
             continue
-        if ta_dt.date() > end_date:
+        if d_obj > end_date:
             continue
         u = r.get("username")
-        v = r.get("views", 0) or 0
-        result[u] = result.get(u, 0) + v
+        if u not in result:
+            result[u] = {"posts": 0, "views": 0}
+        result[u]["posts"] += r.get("post_count", 0) or 0
+        result[u]["views"] += r.get("total_views", 0) or 0
     return result
 
 
@@ -934,16 +962,14 @@ def aggregate_country_clicks(start_date: date, end_date: date) -> list:
     )
     country_totals: dict = {}
     for r in rows:
-        d = r.get("date", "")
         try:
-            d_obj = datetime.fromisoformat(d).date()
+            d_obj = datetime.fromisoformat(r.get("date", "")).date()
         except Exception:
             continue
         if d_obj > end_date:
             continue
         clicks = r.get("clicks", 0) or 0
-        countries = r.get("top_countries") or []
-        for entry in countries:
+        for entry in (r.get("top_countries") or []):
             code = entry.get("code") or "??"
             pct = entry.get("pct", 0) or 0
             country_totals[code] = country_totals.get(code, 0) + clicks * pct / 100
@@ -955,8 +981,7 @@ def aggregate_country_clicks(start_date: date, end_date: date) -> list:
 
 
 def generate_recap_hebdo() -> str:
-    now_paris = datetime.now(PARIS_TZ)
-    today = now_paris.date()
+    today = datetime.now(PARIS_TZ).date()
     week_start = today - timedelta(days=6)
     prev_week_start = today - timedelta(days=13)
     prev_week_end = today - timedelta(days=7)
@@ -966,21 +991,20 @@ def generate_recap_hebdo() -> str:
         "",
     ]
 
-    va_to_users: dict = {}
-    for username, va_name in ACCOUNTS:
-        va_to_users.setdefault(va_name, []).append(username)
+    va_groups = group_by_va()
 
-    clicks_this_week = fetch_aggregated_clicks(week_start, today)
-    clicks_prev_week = fetch_aggregated_clicks(prev_week_start, prev_week_end)
-    views_this_week = fetch_aggregated_views(week_start, today)
-    views_prev_week = fetch_aggregated_views(prev_week_start, prev_week_end)
+    clicks_now = fetch_aggregated_clicks(week_start, today)
+    clicks_prev = fetch_aggregated_clicks(prev_week_start, prev_week_end)
+    posts_now = fetch_aggregated_daily_posts(week_start, today)
+    posts_prev = fetch_aggregated_daily_posts(prev_week_start, prev_week_end)
 
-    va_scores: list = []
-    for va_name, usernames in va_to_users.items():
-        total_clicks = sum(clicks_this_week.get(u, 0) for u in usernames)
+    # Classement VA (clics moyens / compte)
+    va_scores = []
+    for va_name, accounts in va_groups.items():
+        usernames = [u for u, _ in accounts]
+        total = sum(clicks_now.get(u, 0) for u in usernames)
         nb = len(usernames) or 1
-        avg = total_clicks / nb
-        va_scores.append((va_name, total_clicks, avg, nb))
+        va_scores.append((va_name, total, total / nb, nb))
     va_scores.sort(key=lambda x: x[2], reverse=True)
 
     lines.append("🏆 <b>Classement VA (clics moyens / compte)</b>")
@@ -993,81 +1017,83 @@ def generate_recap_hebdo() -> str:
         )
     lines.append("")
 
-    total_clicks_now = sum(clicks_this_week.values())
-    total_clicks_prev = sum(clicks_prev_week.values())
-    if total_clicks_prev > 0:
-        evo_pct = (total_clicks_now - total_clicks_prev) / total_clicks_prev * 100
-        arrow = "📈" if evo_pct >= 0 else "📉"
-        sign = "+" if evo_pct >= 0 else ""
+    # Évolution clics
+    tc_now = sum(clicks_now.values())
+    tc_prev = sum(clicks_prev.values())
+    if tc_prev > 0:
+        evo = (tc_now - tc_prev) / tc_prev * 100
+        arrow = "📈" if evo >= 0 else "📉"
+        sign = "+" if evo >= 0 else ""
         lines.append(
-            f"🔗 <b>Clics totaux :</b> {format_number(total_clicks_now)} "
-            f"({arrow} {sign}{evo_pct:.0f}% vs sem. dernière {format_number(total_clicks_prev)})"
+            f"🔗 <b>Clics :</b> {format_number(tc_now)} ({arrow} {sign}{evo:.0f}% vs sem. dernière)"
         )
     else:
-        lines.append(f"🔗 <b>Clics totaux :</b> {format_number(total_clicks_now)} "
-                     f"(pas de comparaison)")
+        lines.append(f"🔗 <b>Clics :</b> {format_number(tc_now)} (pas de comparaison)")
 
-    total_views_now = sum(views_this_week.values())
-    total_views_prev = sum(views_prev_week.values())
-    if total_views_prev > 0:
-        evo_pct = (total_views_now - total_views_prev) / total_views_prev * 100
-        arrow = "📈" if evo_pct >= 0 else "📉"
-        sign = "+" if evo_pct >= 0 else ""
+    # Évolution vues
+    tv_now = sum(d["views"] for d in posts_now.values())
+    tv_prev = sum(d["views"] for d in posts_prev.values())
+    if tv_prev > 0:
+        evo = (tv_now - tv_prev) / tv_prev * 100
+        arrow = "📈" if evo >= 0 else "📉"
+        sign = "+" if evo >= 0 else ""
         lines.append(
-            f"👁 <b>Vues totales :</b> {format_number(total_views_now)} "
-            f"({arrow} {sign}{evo_pct:.0f}% vs sem. dernière {format_number(total_views_prev)})"
+            f"👁 <b>Vues :</b> {format_number(tv_now)} ({arrow} {sign}{evo:.0f}% vs sem. dernière)"
         )
     else:
-        lines.append(f"👁 <b>Vues totales :</b> {format_number(total_views_now)} "
-                     f"(pas de comparaison)")
+        lines.append(f"👁 <b>Vues :</b> {format_number(tv_now)} (pas de comparaison)")
 
+    # Posts totaux
+    tp_now = sum(d["posts"] for d in posts_now.values())
+    nb_accounts = len(all_usernames())
+    target_week = nb_accounts * DAILY_POSTS_TARGET * 7
+    lines.append(f"📤 <b>Posts :</b> {tp_now}/{target_week} ({tp_now*100//max(target_week,1)}% de l'objectif)")
+
+    # Top pays
     top_countries = aggregate_country_clicks(week_start, today)
     if top_countries:
         cstr = " · ".join(f"{c} ({p}%)" for c, p in top_countries)
         lines.append(f"🌍 <b>Top 3 pays :</b> {cstr}")
     lines.append("")
 
+    # VA sous-perf
     underperf = detect_va_underperf_for_recap()
     if underperf:
-        lines.append("⚠️ <b>VA en sous-perf cette semaine</b>")
-        for va, miss, total in underperf:
-            lines.append(f"  • <b>{va}</b> — {miss} créneaux ratés sur {total}")
+        lines.append("⚠️ <b>Comptes en sous-perf</b> (3+ jours sous l'objectif)")
+        for va, accounts_flagged in underperf:
+            lines.append(f"  <b>{va}</b>")
+            for u, miss_days in accounts_flagged:
+                lines.append(f"    • <code>{u}</code> — {miss_days} jours sous 4 posts")
         lines.append("")
     else:
-        lines.append("✅ <i>Aucun VA en sous-perf cette semaine</i>")
-        lines.append("")
+        lines.append("✅ <i>Aucun compte en sous-perf cette semaine</i>")
 
     return "\n".join(lines)
 
 
 def generate_recap_mensuel() -> str:
-    now_paris = datetime.now(PARIS_TZ)
-    today = now_paris.date()
+    today = datetime.now(PARIS_TZ).date()
     last_day_prev = today.replace(day=1) - timedelta(days=1)
     first_day_prev = last_day_prev.replace(day=1)
     days_in_month = (last_day_prev - first_day_prev).days + 1
     last_day_prev_prev = first_day_prev - timedelta(days=1)
     first_day_prev_prev = last_day_prev_prev.replace(day=1)
-
     month_name = first_day_prev.strftime("%B %Y")
 
     lines = [f"📆 <b>RÉCAP MENSUEL — {month_name}</b>", ""]
 
+    va_groups = group_by_va()
     clicks_m = fetch_aggregated_clicks(first_day_prev, last_day_prev)
     clicks_m_prev = fetch_aggregated_clicks(first_day_prev_prev, last_day_prev_prev)
-    views_m = fetch_aggregated_views(first_day_prev, last_day_prev)
-    views_m_prev = fetch_aggregated_views(first_day_prev_prev, last_day_prev_prev)
+    posts_m = fetch_aggregated_daily_posts(first_day_prev, last_day_prev)
+    posts_m_prev = fetch_aggregated_daily_posts(first_day_prev_prev, last_day_prev_prev)
 
-    va_to_users: dict = {}
-    for username, va_name in ACCOUNTS:
-        va_to_users.setdefault(va_name, []).append(username)
-
-    va_scores: list = []
-    for va_name, usernames in va_to_users.items():
+    va_scores = []
+    for va_name, accounts in va_groups.items():
+        usernames = [u for u, _ in accounts]
         total = sum(clicks_m.get(u, 0) for u in usernames)
         nb = len(usernames) or 1
-        avg = total / nb
-        va_scores.append((va_name, total, avg, nb))
+        va_scores.append((va_name, total, total / nb, nb))
     va_scores.sort(key=lambda x: x[2], reverse=True)
 
     lines.append(f"🏆 <b>Classement VA ({days_in_month} jours)</b>")
@@ -1080,31 +1106,30 @@ def generate_recap_mensuel() -> str:
         )
     lines.append("")
 
-    total_clicks = sum(clicks_m.values())
-    total_clicks_prev = sum(clicks_m_prev.values())
-    if total_clicks_prev > 0:
-        evo = (total_clicks - total_clicks_prev) / total_clicks_prev * 100
+    tc = sum(clicks_m.values())
+    tc_p = sum(clicks_m_prev.values())
+    if tc_p > 0:
+        evo = (tc - tc_p) / tc_p * 100
         arrow = "📈" if evo >= 0 else "📉"
         sign = "+" if evo >= 0 else ""
-        lines.append(
-            f"🔗 <b>Clics totaux :</b> {format_number(total_clicks)} "
-            f"({arrow} {sign}{evo:.0f}% vs mois précédent)"
-        )
+        lines.append(f"🔗 <b>Clics :</b> {format_number(tc)} ({arrow} {sign}{evo:.0f}% vs mois précédent)")
     else:
-        lines.append(f"🔗 <b>Clics totaux :</b> {format_number(total_clicks)}")
+        lines.append(f"🔗 <b>Clics :</b> {format_number(tc)}")
 
-    total_views = sum(views_m.values())
-    total_views_prev = sum(views_m_prev.values())
-    if total_views_prev > 0:
-        evo = (total_views - total_views_prev) / total_views_prev * 100
+    tv = sum(d["views"] for d in posts_m.values())
+    tv_p = sum(d["views"] for d in posts_m_prev.values())
+    if tv_p > 0:
+        evo = (tv - tv_p) / tv_p * 100
         arrow = "📈" if evo >= 0 else "📉"
         sign = "+" if evo >= 0 else ""
-        lines.append(
-            f"👁 <b>Vues totales :</b> {format_number(total_views)} "
-            f"({arrow} {sign}{evo:.0f}% vs mois précédent)"
-        )
+        lines.append(f"👁 <b>Vues :</b> {format_number(tv)} ({arrow} {sign}{evo:.0f}% vs mois précédent)")
     else:
-        lines.append(f"👁 <b>Vues totales :</b> {format_number(total_views)}")
+        lines.append(f"👁 <b>Vues :</b> {format_number(tv)}")
+
+    tp = sum(d["posts"] for d in posts_m.values())
+    nb_accounts = len(all_usernames())
+    target = nb_accounts * DAILY_POSTS_TARGET * days_in_month
+    lines.append(f"📤 <b>Posts :</b> {tp}/{target} ({tp*100//max(target,1)}% de l'objectif)")
 
     top_countries = aggregate_country_clicks(first_day_prev, last_day_prev)
     if top_countries:
@@ -1115,108 +1140,83 @@ def generate_recap_mensuel() -> str:
 
 
 # ============================================================================
-#  COMMANDES INTERACTIVES (handlers)
+#  COMMANDES INTERACTIVES
 # ============================================================================
 
 def cmd_help() -> str:
     return (
         "🤖 <b>Commandes disponibles</b>\n\n"
         "<b>Consultation</b>\n"
-        "  /today — snapshot live de tous les comptes\n"
-        "  /stats &lt;username&gt; — stats d'un compte\n"
+        "  /today — bilan live de tous les comptes (X/4 posts)\n"
+        "  /stats &lt;username&gt; — stats détaillées d'un compte\n"
         "  /week — récap des 7 derniers jours\n"
         "  /top — top 3 Reels du jour\n"
         "  /leaderboard — classement VA live\n\n"
         "<b>Action</b>\n"
         "  /pause &lt;username&gt; — met un compte en pause\n"
         "  /resume &lt;username&gt; — réactive un compte\n"
-        "  /help — affiche cette aide"
+        "  /help — affiche cette aide\n\n"
+        f"<i>Objectif quotidien : {DAILY_POSTS_TARGET} posts par compte</i>"
     )
 
 
 def cmd_today() -> str:
-    now_paris = datetime.now(PARIS_TZ)
-    today = now_paris.date()
-
-    va_groups: dict = {}
-    for username, va_name in ACCOUNTS:
-        va_groups.setdefault(va_name, []).append(username)
-
-    lines = [
-        f"📸 <b>SNAPSHOT LIVE</b> — {now_paris.strftime('%d/%m %H:%M')}",
-        "",
-    ]
-    total_posts = 0
-
-    for va_name, usernames in va_groups.items():
-        lines.append(f"👤 <b>{va_name}</b>")
-        for username in usernames:
-            reels = fetch_recent_reels(username)
-            today_reels = []
-            for r in reels[:8]:
-                post_dt = reel_post_dt(r)
-                if post_dt and post_dt.date() == today:
-                    today_reels.append((post_dt, r))
-            if today_reels:
-                total_posts += len(today_reels)
-                lines.append(f"  ✅ <code>{username}</code> ({len(today_reels)} post(s) aujourd'hui)")
-                for post_dt, r in today_reels:
-                    _, views, likes, _ = parse_reel_stats(r)
-                    lines.append(
-                        f"     {post_dt.strftime('%Hh%M')} — "
-                        f"👁 {format_number(views)} · ❤️ {format_number(likes)}{reel_link(r)}"
-                    )
-            else:
-                lines.append(f"  ❌ <code>{username}</code> — pas de post aujourd'hui")
-        lines.append("")
-
-    lines.append(f"📈 <b>{total_posts} posts aujourd'hui</b>")
-    return "\n".join(lines)
+    """Bilan live (sans attendre 20h)."""
+    return generate_insta_recap().replace("BILAN INSTA", "SNAPSHOT LIVE")
 
 
 def cmd_stats(username: str) -> str:
-    valid_usernames = [u for u, _ in ACCOUNTS]
-    matched = None
-    for u in valid_usernames:
-        if u.lower() == username.lower():
-            matched = u
-            break
+    valid = all_usernames()
+    matched = next((u for u in valid if u.lower() == username.lower()), None)
     if not matched:
         return (
             f"❌ Compte <code>{username}</code> non trouvé.\n\n"
-            f"Comptes valides :\n" +
-            "\n".join(f"  • <code>{u}</code>" for u in valid_usernames)
+            "Comptes valides :\n" +
+            "\n".join(f"  • <code>{u}</code>" for u in valid)
         )
     username = matched
-
     now_paris = datetime.now(PARIS_TZ)
     today = now_paris.date()
     yesterday = (now_paris - timedelta(days=1)).date()
 
     reels = fetch_recent_reels(username)
+    if not reels:
+        return f"⚠️ Impossible de récupérer les Reels de <code>{username}</code>."
 
+    today_posts = collect_today_posts(reels)
+    count = len(today_posts)
+    total_views = sum(int(parse_reel_stats(r)[1] or 0) for _, r in today_posts)
+
+    emoji = status_emoji(count)
     lines = [
-        f"📊 <b>STATS LIVE — {username}</b>",
+        f"📊 <b>STATS — {username}</b>",
         f"<i>{now_paris.strftime('%d/%m %H:%M')}</i>",
+        "",
+        f"{emoji} <b>Aujourd'hui : {count}/{DAILY_POSTS_TARGET} posts · 👁 {format_number(total_views)} vues</b>",
         "",
     ]
 
-    if not reels:
-        lines.append("⚠️ Impossible de récupérer les Reels.")
-        return "\n".join(lines)
+    if today_posts:
+        lines.append("<b>Posts du jour</b>")
+        for post_dt, r in today_posts:
+            _, views, likes, _ = parse_reel_stats(r)
+            lines.append(
+                f"  • {post_dt.strftime('%H:%M')} — "
+                f"👁 {format_number(views)} · ❤️ {format_number(likes)} · {reel_link_html(r)}"
+            )
+        lines.append("")
 
-    lines.append("<b>5 derniers Reels</b>")
+    lines.append("<b>5 derniers Reels (tous)</b>")
     for r in reels[:5]:
-        _, views, likes, comments = parse_reel_stats(r)
+        _, views, likes, _ = parse_reel_stats(r)
         post_dt = reel_post_dt(r)
-        date_str = post_dt.strftime("%d/%m %Hh%M") if post_dt else "?"
+        date_str = post_dt.strftime("%d/%m %H:%M") if post_dt else "?"
         lines.append(
-            f"  • {date_str} — 👁 {format_number(views)} · "
-            f"❤️ {format_number(likes)} · 💬 {format_number(comments)}{reel_link(r)}"
+            f"  • {date_str} — 👁 {format_number(views)} · ❤️ {format_number(likes)} · {reel_link_html(r)}"
         )
     lines.append("")
 
-    lines.append("<b>Clics GMS</b>")
+    # Clics
     rows_today = supabase_select(
         "daily_clicks",
         {"username": f"eq.{username}", "date": f"eq.{today.isoformat()}", "limit": 1},
@@ -1225,17 +1225,16 @@ def cmd_stats(username: str) -> str:
         "daily_clicks",
         {"username": f"eq.{username}", "date": f"eq.{yesterday.isoformat()}", "limit": 1},
     )
-
+    lines.append("<b>Clics GMS</b>")
     if rows_today:
-        clicks = rows_today[0].get("clicks", 0) or 0
+        c = rows_today[0].get("clicks", 0) or 0
         countries = rows_today[0].get("top_countries", []) or []
-        cstr = " · ".join(f"{c.get('code', '??')} ({c.get('pct', 0)}%)" for c in countries[:3]) if countries else "—"
-        lines.append(f"  Aujourd'hui : <b>{format_number(clicks)}</b> clics · 🌍 {cstr}")
+        cstr = " · ".join(f"{x.get('code','??')} ({x.get('pct',0)}%)" for x in countries[:3]) if countries else "—"
+        lines.append(f"  Aujourd'hui : <b>{format_number(c)}</b> · 🌍 {cstr}")
     else:
         lines.append("  Aujourd'hui : pas encore de data")
-
     if rows_yest:
-        lines.append(f"  Hier : <b>{format_number(rows_yest[0].get('clicks', 0) or 0)}</b> clics")
+        lines.append(f"  Hier : <b>{format_number(rows_yest[0].get('clicks',0) or 0)}</b>")
 
     return "\n".join(lines)
 
@@ -1243,57 +1242,40 @@ def cmd_stats(username: str) -> str:
 def cmd_top() -> str:
     now_paris = datetime.now(PARIS_TZ)
     today = now_paris.date()
-
     all_reels = []
-    for username, va_name in ACCOUNTS:
+    for username, va_name, _ in iter_accounts():
         reels = fetch_recent_reels(username)
         for r in reels[:5]:
-            post_dt = reel_post_dt(r)
-            if not post_dt or post_dt.date() != today:
-                continue
-            _, views, likes, comments = parse_reel_stats(r)
-            all_reels.append((username, va_name, post_dt, views, likes, comments, r))
-
+            dt = reel_post_dt(r)
+            if dt and dt.date() == today:
+                _, views, likes, comments = parse_reel_stats(r)
+                all_reels.append((username, va_name, dt, views, likes, comments, r))
     if not all_reels:
         return "📭 Aucun Reel publié aujourd'hui."
-
     all_reels.sort(key=lambda x: x[3] or 0, reverse=True)
     top3 = all_reels[:3]
-
     medals = ["🥇", "🥈", "🥉"]
-    lines = [
-        f"🔥 <b>TOP 3 REELS DU JOUR</b>",
-        f"<i>{now_paris.strftime('%d/%m %H:%M')}</i>",
-        "",
-    ]
-    for i, (username, va_name, post_dt, views, likes, comments, r) in enumerate(top3):
+    lines = [f"🔥 <b>TOP 3 REELS DU JOUR</b>", f"<i>{now_paris.strftime('%d/%m %H:%M')}</i>", ""]
+    for i, (u, va, dt, v, lk, cm, r) in enumerate(top3):
         lines.append(
-            f"{medals[i]} <code>{username}</code> ({va_name})\n"
-            f"   Posté {post_dt.strftime('%Hh%M')}{reel_link(r)}\n"
-            f"   👁 {format_number(views)} · ❤️ {format_number(likes)} · 💬 {format_number(comments)}"
+            f"{medals[i]} <code>{u}</code> ({va}) — {dt.strftime('%H:%M')}\n"
+            f"   👁 {format_number(v)} · ❤️ {format_number(lk)} · 💬 {format_number(cm)} · {reel_link_html(r)}"
         )
-
     return "\n".join(lines)
 
 
 def cmd_leaderboard() -> str:
     today = datetime.now(PARIS_TZ).date()
     week_start = today - timedelta(days=6)
-
     clicks = fetch_aggregated_clicks(week_start, today)
-
-    va_to_users: dict = {}
-    for username, va_name in ACCOUNTS:
-        va_to_users.setdefault(va_name, []).append(username)
-
+    va_groups = group_by_va()
     va_scores = []
-    for va_name, usernames in va_to_users.items():
+    for va_name, accounts in va_groups.items():
+        usernames = [u for u, _ in accounts]
         total = sum(clicks.get(u, 0) for u in usernames)
         nb = len(usernames) or 1
-        avg = total / nb
-        va_scores.append((va_name, total, avg, nb))
+        va_scores.append((va_name, total, total / nb, nb))
     va_scores.sort(key=lambda x: x[2], reverse=True)
-
     lines = [f"🏆 <b>CLASSEMENT VA</b> (7 derniers jours)", ""]
     medals = ["🥇", "🥈", "🥉"]
     for i, (va, total, avg, nb) in enumerate(va_scores):
@@ -1306,35 +1288,32 @@ def cmd_leaderboard() -> str:
 
 
 def handle_command(text: str) -> Optional[str]:
-    """Dispatch d'une commande. Renvoie la réponse ou None si commande inconnue."""
     parts = text.strip().split()
     if not parts or not parts[0].startswith("/"):
         return None
-    # Gère /command@bot_name
     cmd = parts[0].lower().split("@")[0]
     args = parts[1:]
-
     try:
-        if cmd == "/help" or cmd == "/start":
+        if cmd in ("/help", "/start"):
             return cmd_help()
-        elif cmd == "/today":
+        if cmd == "/today":
             return cmd_today()
-        elif cmd == "/stats":
+        if cmd == "/stats":
             if not args:
                 return "Usage : <code>/stats &lt;username&gt;</code>"
             return cmd_stats(args[0])
-        elif cmd == "/week":
+        if cmd == "/week":
             return generate_recap_hebdo()
-        elif cmd == "/top":
+        if cmd == "/top":
             return cmd_top()
-        elif cmd == "/leaderboard":
+        if cmd == "/leaderboard":
             return cmd_leaderboard()
-        elif cmd == "/pause":
+        if cmd == "/pause":
             if not args:
                 return "Usage : <code>/pause &lt;username&gt;</code>"
             _, msg = toggle_account_pause(args[0], pause=True)
             return msg
-        elif cmd == "/resume":
+        if cmd == "/resume":
             if not args:
                 return "Usage : <code>/resume &lt;username&gt;</code>"
             _, msg = toggle_account_pause(args[0], pause=False)
@@ -1346,12 +1325,9 @@ def handle_command(text: str) -> Optional[str]:
 
 
 def telegram_polling_loop() -> None:
-    """Boucle infinie de polling Telegram. Tourne dans le thread principal."""
     log.info("Telegram polling started")
-    # On commence avec un offset basé sur le dernier update connu (skip backlog)
     initial = poll_telegram_updates(-1)
     last_update_id = initial[-1]["update_id"] + 1 if initial else 0
-
     while True:
         try:
             updates = poll_telegram_updates(last_update_id)
@@ -1364,7 +1340,6 @@ def telegram_polling_loop() -> None:
                 if not text or not text.startswith("/"):
                     continue
                 chat_id = message.get("chat", {}).get("id")
-                # Filtre : on n'accepte les commandes que depuis le canal configuré
                 if str(chat_id) != str(TELEGRAM_CHAT_ID):
                     continue
                 response = handle_command(text)
@@ -1379,23 +1354,18 @@ def telegram_polling_loop() -> None:
 #  JOBS PROGRAMMÉS
 # ============================================================================
 
-def job_insta_matin() -> None:
-    log.info("Job INSTA MATIN")
-    send_telegram(generate_insta_report(MATIN_TARGET, "INSTA MATIN", "matin"))
-
-
-def job_insta_soir() -> None:
-    log.info("Job INSTA SOIR")
-    send_telegram(generate_insta_report(SOIR_TARGET, "INSTA SOIR", "soir"))
+def job_insta_recap() -> None:
+    log.info("Job INSTA RECAP 20h")
+    send_telegram(generate_insta_recap())
 
 
 def job_clics_minuit() -> None:
-    log.info("Job CLICS MINUIT (jour J-1)")
+    log.info("Job CLICS MINUIT")
     send_telegram(generate_clicks_report("yesterday", "CLICS — JOUR COMPLET", "🌙"))
 
 
 def job_clics_midi() -> None:
-    log.info("Job CLICS MIDI (depuis 00h)")
+    log.info("Job CLICS MIDI")
     send_telegram(generate_clicks_report("today", "CLICS — MI-JOURNÉE", "☀️"))
 
 
@@ -1414,23 +1384,25 @@ def job_recap_mensuel() -> None:
 # ============================================================================
 
 def send_startup_message() -> None:
-    nb_comptes = len(ACCOUNTS)
-    nb_va = len({va for _, va in ACCOUNTS})
+    nb_comptes = len(all_usernames())
+    nb_va = len(group_by_va())
     gms_status = "✅ activé" if GMS_API_KEY else "⚠️ désactivé"
     sb_status = "✅ activé" if (SUPABASE_URL and SUPABASE_KEY) else "⚠️ désactivé"
     gh_status = "✅ activé" if (GITHUB_TOKEN and GITHUB_REPO) else "⚠️ désactivé"
+    # Compter les overrides GMS configurés
+    nb_overrides = sum(1 for _, _, g in iter_accounts() if g)
     msg = (
-        "🟢 <b>Bot démarré</b>\n"
-        f"📊 {nb_comptes} comptes surveillés\n"
+        "🟢 <b>Bot démarré</b> (v2.1)\n"
+        f"📊 {nb_comptes} comptes surveillés (objectif : {DAILY_POSTS_TARGET} posts/jour)\n"
         f"👥 {nb_va} VA\n"
         f"🔗 GetMySocial : {gms_status}\n"
         f"💾 Supabase : {sb_status}\n"
         f"🛠 GitHub auto-commit : {gh_status}\n"
+        f"🎯 Mappings GMS manuels : {nb_overrides}/{nb_comptes}\n"
         "⏰ Rapports automatiques :\n"
         "   🌙 00h00 — Clics jour complet\n"
-        "   🌅 09h30 — Insta matin\n"
         "   ☀️ 12h00 — Clics mi-journée\n"
-        "   🌆 20h00 — Insta soir\n"
+        "   🌆 20h00 — Bilan Insta\n"
         "   📅 Dimanche 20h05 — Récap hebdo\n"
         "   📆 1er du mois 09h35 — Récap mensuel\n"
         "💬 Tape <code>/help</code> pour voir les commandes"
@@ -1439,14 +1411,13 @@ def send_startup_message() -> None:
 
 
 def main() -> None:
-    log.info("Starting bot — %d comptes surveillés", len(ACCOUNTS))
+    log.info("Starting bot — %d comptes surveillés", len(all_usernames()))
     send_startup_message()
 
     scheduler = BackgroundScheduler(timezone=PARIS_TZ)
     scheduler.add_job(job_clics_minuit, "cron", hour=0,  minute=0)
-    scheduler.add_job(job_insta_matin,  "cron", hour=9,  minute=30)
     scheduler.add_job(job_clics_midi,   "cron", hour=12, minute=0)
-    scheduler.add_job(job_insta_soir,   "cron", hour=20, minute=0)
+    scheduler.add_job(job_insta_recap,  "cron", hour=20, minute=0)
     scheduler.add_job(job_recap_hebdo,  "cron", day_of_week="sun", hour=20, minute=5)
     scheduler.add_job(job_recap_mensuel,"cron", day=1, hour=9, minute=35)
     scheduler.start()
